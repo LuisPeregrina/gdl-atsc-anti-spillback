@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Training artifacts (LibreYOLO / YOLO)
+runs/
+
+# Weights lockfile
+*.download.lock
+
+.DS_Store
+weights/

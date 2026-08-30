@@ -32,15 +32,60 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import random
-import tempfile
 from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict
+
+
+class CocoImage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: int
+    file_name: str
+    width: int
+    height: int
+    license: int | None = None
+    flickr_url: str | None = None
+    coco_url: str | None = None
+    date_captured: str | None = None
+
+
+class CocoAnnotation(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: int
+    image_id: int
+    category_id: int
+    bbox: list[float]
+    area: float | None = None
+    segmentation: list[list[float]] | list[float] | None = None
+    iscrowd: int | None = None
+    ignore: int | None = None
+
+
+class CocoCategory(BaseModel):
+    id: int
+    name: str
+    supercategory: str | None = None
+
+
+class CocoDataset(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    images: list[CocoImage]
+    annotations: list[CocoAnnotation]
+    categories: list[CocoCategory] | None = None
+
+
+SplitPaths = dict[str, Path]
+SplitImageLists = dict[str, list[str]]
+
 
 KEEP_CATEGORIES = {
     2: "bicycle",
     3: "car",
-    #4: "motorcycle",  # Not present in the dataset
+    # 4: "motorcycle",  # Not present in the dataset
     6: "bus",
     8: "lorry",  # this dataset annotates as lorry instead of truck
     # TODO: Emergency vehicles, need different / complementary dataset
@@ -53,15 +98,15 @@ RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 CATEGORY_INDEX = {cid: i for i, cid in enumerate(KEEP_CATEGORIES)}
 
 
-def load(dataset_root: Path) -> tuple[list[dict], list[dict]]:
+def load(dataset_root: Path) -> tuple[list[CocoImage], list[CocoAnnotation]]:
     """Load and merge both COCO jsons into (images, annotations).
 
     Images are re-keyed to a single non-overlapping id range across the two
     files (they use overlapping id ranges), and every annotation's image_id is
     remapped to the new value. Only kept categories are returned.
     """
-    images: list[dict] = []
-    annotations: list[dict] = []
+    images: list[CocoImage] = []
+    annotations: list[CocoAnnotation] = []
     cat_ids = set(KEEP_CATEGORIES)
 
     ann_id_offset = 0
@@ -70,34 +115,34 @@ def load(dataset_root: Path) -> tuple[list[dict], list[dict]]:
         path = dataset_root / json_name
         if not path.exists():
             raise FileNotFoundError(path)
-        data = json.loads(path.read_text())
+        data = CocoDataset.model_validate_json(path.read_text())
 
         # Re-key image ids so they stay unique across both files (the two
         # COCO files use overlapping id ranges). Must also remap every
         # annotation's image_id to the new value.
         old_to_new: dict[int, int] = {}
-        for img in data["images"]:
-            img = dict(img)
+        for img in data.images:
+            new_img = CocoImage(**img.model_dump())
             new_id = img_id_offset
             img_id_offset += 1
-            old_to_new[img["id"]] = new_id
-            img["id"] = new_id
-            images.append(img)
+            old_to_new[img.id] = new_id
+            new_img.id = new_id
+            images.append(new_img)
 
-        for ann in data["annotations"]:
-            if ann["category_id"] not in cat_ids:
+        for ann in data.annotations:
+            if ann.category_id not in cat_ids:
                 continue
-            ann = dict(ann)
-            ann["id"] = ann_id_offset
+            new_ann = CocoAnnotation(**ann.model_dump())
+            new_ann.id = ann_id_offset
             ann_id_offset += 1
-            ann["image_id"] = old_to_new[ann["image_id"]]
-            annotations.append(ann)
+            new_ann.image_id = old_to_new[ann.image_id]
+            annotations.append(new_ann)
 
     return images, annotations
 
 
 def split(
-    images: list[dict],
+    images: list[CocoImage],
     seed: int,
     ratios: dict[str, float] | None = None,
 ) -> dict[int, str]:
@@ -119,14 +164,14 @@ def split(
         chunk = images[cursor : cursor + n]
         cursor += n
         for img in chunk:
-            assignments[img["id"]] = split_name
+            assignments[img.id] = split_name
     # Sweep the remainder (rounding) into test.
     for img in images[cursor:]:
-        assignments[img["id"]] = "test"
+        assignments[img.id] = "test"
     return assignments
 
 
-def yolo_line(ann: dict, img: dict) -> str | None:
+def yolo_line(ann: CocoAnnotation, img: CocoImage) -> str | None:
     """Convert one COCO annotation to a YOLO label line.
 
     YOLO format: ``class cx cy w h``, all normalized to [0, 1]. COCO bbox is
@@ -137,8 +182,8 @@ def yolo_line(ann: dict, img: dict) -> str | None:
     within [0, 1] (the source COCO has boxes extending past image edges).
     Returns ``None`` if clipping leaves a degenerate (zero-area) box.
     """
-    x, y, w, h = ann["bbox"]
-    W, H = img["width"], img["height"]
+    x, y, w, h = ann.bbox
+    W, H = img.width, img.height
     x0 = max(0.0, x)
     y0 = max(0.0, y)
     x1 = min(W, x + w)
@@ -146,7 +191,7 @@ def yolo_line(ann: dict, img: dict) -> str | None:
     if x1 <= x0 or y1 <= y0:
         return None
     cw, ch = x1 - x0, y1 - y0
-    cls = CATEGORY_INDEX[ann["category_id"]]
+    cls = CATEGORY_INDEX[ann.category_id]
     return (
         f"{cls} "
         f"{(x0 + cw / 2) / W:.6f} "
@@ -158,9 +203,9 @@ def yolo_line(ann: dict, img: dict) -> str | None:
 
 def dedupe_by_content(
     dataset_root: Path,
-    images: list[dict],
-    annotations: list[dict],
-) -> tuple[list[dict], list[dict], list[dict]]:
+    images: list[CocoImage],
+    annotations: list[CocoAnnotation],
+) -> tuple[list[CocoImage], list[CocoAnnotation], list[CocoImage]]:
     """Drop content-identical duplicate images, keeping the first occurrence.
 
     The MTID download duplicates some frames byte-for-byte (e.g.
@@ -173,22 +218,18 @@ def dedupe_by_content(
     """
     seen: set[str] = set()
     kept_ids: set[int] = set()
-    kept_images: list[dict] = []
-    dropped_images: list[dict] = []
+    kept_images: list[CocoImage] = []
+    dropped_images: list[CocoImage] = []
     for img in images:
-        digest = hashlib.sha1(
-            (dataset_root / img["file_name"]).read_bytes()
-        ).hexdigest()
+        digest = hashlib.sha1((dataset_root / img.file_name).read_bytes()).hexdigest()
         if digest in seen:
             dropped_images.append(img)
             continue
         seen.add(digest)
-        kept_ids.add(img["id"])
+        kept_ids.add(img.id)
         kept_images.append(img)
 
-    kept_annotations = [
-        ann for ann in annotations if ann["image_id"] in kept_ids
-    ]
+    kept_annotations = [ann for ann in annotations if ann.image_id in kept_ids]
     dropped = len(images) - len(kept_images)
     if dropped:
         print(f"deduplicated {dropped} content-identical image(s)")
@@ -197,10 +238,9 @@ def dedupe_by_content(
 
 def write_yolo_labels(
     dataset_root: Path,
-    images: list[dict],
-    annotations: list[dict],
-    assignments: dict[int, str],
-    dropped_images: list[dict] | None = None,
+    images: list[CocoImage],
+    annotations: list[CocoAnnotation],
+    dropped_images: list[CocoImage] | None = None,
 ) -> None:
     """Write a YOLO label .txt next to each image (x.jpg -> x.txt).
 
@@ -210,16 +250,16 @@ def write_yolo_labels(
     Any stale label file for a dropped (deduplicated) image is removed so no
     orphan label (``files.orphan_label``) lingers from a previous run.
     """
-    ann_by_img: dict[int, list[dict]] = {}
+    ann_by_img: dict[int, list[CocoAnnotation]] = {}
     for ann in annotations:
-        ann_by_img.setdefault(ann["image_id"], []).append(ann)
+        ann_by_img.setdefault(ann.image_id, []).append(ann)
 
     written = 0
     for img in images:
-        img_path = dataset_root / img["file_name"]
+        img_path = dataset_root / img.file_name
         label_path = img_path.with_suffix(".txt")
-        lines = []
-        for ann in ann_by_img.get(img["id"], []):
+        lines: list[str] = []
+        for ann in ann_by_img.get(img.id, []):
             line = yolo_line(ann, img)
             if line is not None:
                 lines.append(line)
@@ -228,19 +268,21 @@ def write_yolo_labels(
 
     removed = 0
     for img in dropped_images or []:
-        label_path = (dataset_root / img["file_name"]).with_suffix(".txt")
+        label_path = (dataset_root / img.file_name).with_suffix(".txt")
         if label_path.exists():
             label_path.unlink()
             removed += 1
-    print(f"wrote {written} YOLO label files beside images"
-          + (f"; removed {removed} stale label(s)" if removed else ""))
+    print(
+        f"wrote {written} YOLO label files beside images"
+        + (f"; removed {removed} stale label(s)" if removed else "")
+    )
 
 
 def write_split_lists(
     dataset_root: Path,
-    images: list[dict],
+    images: list[CocoImage],
     assignments: dict[int, str],
-) -> dict[str, Path]:
+) -> SplitPaths:
     """Write one image-list text file per split, into the dataset root.
 
     Each ``{split}.list.txt`` lists the image paths (relative to the dataset
@@ -248,23 +290,23 @@ def write_split_lists(
     reference the lists by bare name under ``path:``; LibreYOLO resolves each
     entry relative to the list file's directory (= the dataset root).
     """
-    by_split = {s: [] for s in SPLITS}
+    by_split: SplitImageLists = {"train": [], "val": [], "test": []}
     for img in images:
-        by_split[assignments[img["id"]]].append(img["file_name"])
+        by_split[assignments[img.id]].append(img.file_name)
 
-    paths: dict[str, Path] = {}
+    paths_dict: dict[str, Path] = {}
     for s in SPLITS:
         path = dataset_root / f"{s}.list.txt"
         path.write_text("".join(f"{p}\n" for p in sorted(by_split[s])))
         print(f"wrote {path} ({len(by_split[s])} images)")
-        paths[s] = path
-    return paths
+        paths_dict[s] = path
+    return paths_dict  # type: ignore[return-value]
 
 
 def write_data_yaml(
     dataset_root: Path,
     out_path: Path,
-    list_paths: dict[str, Path],
+    list_paths: SplitPaths,
 ) -> Path:
     """Write the LibreYOLO data.yaml pointing at the image-list files.
 
@@ -274,10 +316,7 @@ def write_data_yaml(
     block: LibreYOLO loads labels via YOLODataset (image list + derived label
     paths).
     """
-    names = {
-        label: name
-        for label, (cid, name) in enumerate(KEEP_CATEGORIES.items())
-    }
+    names = {label: name for label, (_cid, name) in enumerate(KEEP_CATEGORIES.items())}
     content = (
         "# Autogenerated by tools/split_yolo.py. Do not edit.\n"
         f"# MTID (Multiview Traffic Intersection Dataset) - combined drone + infra.\n"
@@ -309,9 +348,9 @@ def split_dataset(
 ) -> Path:
     """Build the YOLO-format split dataset and return the data.yaml path.
 
-    Writes YOLO label files beside the source images and the image-list files
-    (train/val/test.list.txt) into the dataset root. ``out_dir`` receives the
-    mtid.yaml (defaults to an ephemeral temp dir).
+    Writes YOLO label files beside the source images and the split list files
+    (train/val/test.list.txt) into the dataset root. ``mtid.yaml`` lives next to
+    those artifacts by default, in the dataset directory itself.
     """
     root = Path(dataset_root)
     if not root.exists():
@@ -327,13 +366,7 @@ def split_dataset(
             f"train_ratio + val_ratio ({train_ratio} + {val_ratio}) must be <= 1.0"
         )
 
-    # Default to an ephemeral temp dir (split lists/yaml are regenerable
-    # artifacts; they don't belong in the dataset or the repo). YOLO labels
-    # are written beside the source images regardless of out_dir.
-    if out_dir is None:
-        out_path = Path(tempfile.mkdtemp(prefix="mtid-split-"))
-    else:
-        out_path = Path(out_dir)
+    out_path = Path(out_dir) if out_dir is not None else root
     out_path.mkdir(parents=True, exist_ok=True)
 
     images, annotations = load(root)
@@ -344,14 +377,16 @@ def split_dataset(
 
     counts = {s: 0 for s in SPLITS}
     for img in images:
-        counts[assignments[img["id"]]] += 1
+        counts[assignments[img.id]] += 1
     total = sum(counts.values())
-    print(f"total: {total} images across {', '.join(SPLITS)} "
-          f"({', '.join(f'{s}: {counts[s]}' for s in SPLITS)})")
+    print(
+        f"total: {total} images across {', '.join(SPLITS)} "
+        f"({', '.join(f'{s}: {counts[s]}' for s in SPLITS)})"
+    )
 
     # Convert COCO annotations -> YOLO label files, then write the image lists
     # and the data.yaml that points LibreYOLO at those lists.
-    write_yolo_labels(root, images, annotations, assignments, dropped)
+    write_yolo_labels(root, images, annotations, dropped)
     list_paths = write_split_lists(root, images, assignments)
     yaml_path = write_data_yaml(root, out_path / "mtid.yaml", list_paths)
 
@@ -370,16 +405,21 @@ def main() -> None:
         "--out",
         type=Path,
         default=None,
-        help="Output directory for mtid.yaml (default: temp dir)",
+        help="Output directory for mtid.yaml (default: dataset root)",
     )
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for deterministic split")
     parser.add_argument(
-        "--train-ratio", type=float, default=0.8,
+        "--seed", type=int, default=42, help="Random seed for deterministic split"
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.8,
         help="Fraction of images for train (default: 0.8)",
     )
     parser.add_argument(
-        "--val-ratio", type=float, default=0.1,
+        "--val-ratio",
+        type=float,
+        default=0.1,
         help="Fraction of images for val (default: 0.1); test = 1 - train - val",
     )
     args = parser.parse_args()

@@ -9,7 +9,8 @@ from libreyolo.training import TrainEndEvent, TrainEpochEvent, TrainStartEvent, 
 
 from tools.mtid_split_yolo import split_dataset
 
-MODEL_NAME = "LibreYOLO9t"
+MODEL_NAME = "LibreFOMOs-point"
+#!curl -L https://huggingface.co/LibreYOLO/{MODEL_NAME}/resolve/main/{MODEL_NAME}.pt -o weights/{MODEL_NAME}.pt
 
 DATASET_PATH = Path.cwd() / "dataset"
 DATASET_NAME = "andreasmoegelmose/multiview-traffic-intersection-dataset"
@@ -21,6 +22,7 @@ model = next((m for m in models if m["name"] == MODEL_NAME), None)
 IMAGE_SIZE = int(model["image_size"])
 BATCH_SIZE = int(model["batch_size"])
 dataset_path = kagglehub.dataset_download(DATASET_NAME, output_dir=str(DATASET_PATH))
+MINUTES = 1
 
 
 yaml_path = split_dataset(dataset_path)
@@ -42,14 +44,14 @@ class RunLog:
             print(f"new best at epoch {event.epoch}: {event.best_metric}")
 
         self.copy_last(event)
-        print("Sleeping 3 minutes to cool down...")
-        sleep(60*3)
+        # print(f"Sleeping {MINUTES} minutes to cool down...")
+        # sleep(60*MINUTES)
  
 
 
+resuming = False
 
-
-model = LibreYOLO("last.pt")
+model = LibreYOLO(f"{MODEL_NAME}.pt" if not resuming else "last.pt")
 last_weights_path = None
 model.train(
         data=yaml_path,
@@ -58,5 +60,5 @@ model.train(
         batch=BATCH_SIZE,
         workers=0,
         callbacks=RunLog(),
-        resume=True
+        resume=resuming
     )

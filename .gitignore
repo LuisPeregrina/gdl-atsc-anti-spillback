@@ -13,3 +13,6 @@ runs/
 .DS_Store
 weights/
 dataset/
+
+# Generated dataset builds (symlinks + regenerable COCO jsons)
+dataset_build/

@@ -1,8 +1,0 @@
----
-models:
-  - name: LibreFOMOs-point
-    image_size: 96
-    batch_size: -1
-  - name: LibreYOLO9t
-    image_size: 640
-    batch_size: -1

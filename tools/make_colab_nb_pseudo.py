@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Emit colab_pseudo_label.ipynb (Stage 2 pseudo-labeling on a Colab GPU).
+
+Loads the Colab-trained per-view baseline (Drive weights), labels a sampled
+subset of the still-unannotated MTID frames via tools/auto_label.py, and writes
+a reviewable candidate COCO json plus a merged GT+pseudo training json. Outputs
+copied back to Drive.
+"""
+
+import json
+
+CELLS = [
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "%pip install -q kagglehub \"libreyolo[onnx,openvino,fast-eval]\" nncf\n",
+            "%pip install -q --upgrade jupyter ipywidgets\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "!git clone -q https://github.com/LuisPeregrina/gdl-atsc-anti-spillback.git gdl\n",
+            "%cd /content/gdl\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "import os\n",
+            "os.environ.setdefault(\"PYTORCH_CUDA_ALLOC_CONF\", \"expandable_segments:True\")\n",
+            "\n",
+            "import pathlib\n",
+            "from pathlib import Path\n",
+            "import torch\n",
+            "torch.serialization.add_safe_globals([pathlib._local.PosixPath])\n",
+            "\n",
+            "import kagglehub\n",
+            "from libreyolo import LibreYOLO\n",
+            "\n",
+            "print('cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# Download immutable MTID source into Colab.\n",
+            "DATASET_NAME = \"andreasmoegelmose/multiview-traffic-intersection-dataset\"\n",
+            "source_root = Path(kagglehub.dataset_download(DATASET_NAME))\n",
+            "print('source_root:', source_root)\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# Stage 0: materialise the per-view native-COCO build (copies, not symlinks).\n",
+            "from tools.mtid_coco_build import CocoBuild, VIEWS\n",
+            "\n",
+            "BUILD_ROOT = Path(\"/content/gdl/dataset_build\")\n",
+            "view = \"Drone\"  # pseudo-label this view now (Drone baseline is trained)\n",
+            "b = CocoBuild(source_root, BUILD_ROOT, view, seed=42, materialize=True)\n",
+            "b.build()\n",
+            "_view_name = VIEWS[view][1]\n",
+            "build_dir = BUILD_ROOT / _view_name\n",
+            "print('build_dir:', build_dir)\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# Mount Drive and locate the trained baseline checkpoint.\n",
+            "from google.colab import drive\n",
+            "drive.mount('/content/drive')\n",
+            "drive_root = Path('/content/drive/MyDrive')\n",
+            "\n",
+            "base = drive_root / 'gdl-atsc-anti-spillback' / 'baseline_runs'\n",
+            "best = sorted((base / 'mtid_drone' / 'weights').glob('best.pt'))\n",
+            "if not best:\n",
+            "    raise FileNotFoundError('best.pt not found under ' + str(base / 'mtid_drone'))\n",
+            "WEIGHTS = str(best[0])\n",
+            "print('weights:', WEIGHTS)\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# Stage 2: pseudo-label the sampled unannotated pool.\n",
+            "from tools.auto_label import pseudo_label_view\n",
+            "\n",
+            "STRIDE = 30   # ~1 frame/s at 30 fps\n",
+            "CONF = 0.60   # min detection confidence to accept as pseudo-label\n",
+            "\n",
+            "candidate, merged = pseudo_label_view(\n",
+            "    build_dir=build_dir,\n",
+            "    source_root=source_root,\n",
+            "    view_key=view,\n",
+            "    weights=WEIGHTS,\n",
+            "    stride=STRIDE,\n",
+            "    conf=CONF,\n",
+            "    materialize=True,\n",
+            ")\n",
+            "print('candidate:', candidate)\n",
+            "print('merged train:', merged)\n",
+        ],
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# Persist results to Drive.\n",
+            "import shutil\n",
+            "out_dir = drive_root / 'gdl-atsc-anti-spillback' / 'pseudo_labels' / view.lower()\n",
+            "out_dir.mkdir(parents=True, exist_ok=True)\n",
+            "for p in [candidate, merged]:\n",
+            "    shutil.copy2(p, out_dir / p.name)\n",
+            "    print('saved', p.name, '->', out_dir)\n",
+        ],
+    },
+]
+
+nb = {
+    "cells": CELLS,
+    "metadata": {
+        "colab": {"provenance": []},
+        "kernelspec": {"display_name": "Python 3", "name": "python3"},
+        "language_info": {"name": "python"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 0,
+}
+
+with open("colab_pseudo_label.ipynb", "w") as f:
+    json.dump(nb, f, indent=1)
+print("wrote colab_pseudo_label.ipynb")
